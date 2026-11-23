@@ -1,0 +1,188 @@
+name: Build release APK
+
+# 手动触发：构建 :app:assembleRootRelease（R8 + shrinkResources）并产出可直接安装的 release APK。
+# 有正式签名密钥时优先使用 secrets；没有时自动生成临时 keystore 签名（产物可安装，但不能覆盖旧版本）。
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "版本名（留空则按 tag / 短提交号自动推导）"
+        required: false
+        default: ""
+      publish_release:
+        description: "构建成功后创建 GitHub Release 并上传 APK"
+        type: boolean
+        required: false
+        default: false
+      run_tests:
+        description: "构建前执行单元测试"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Assemble release APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Resolve version metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_version="${{ inputs.version_name }}"
+          if [ -n "${input_version}" ]; then
+            version="${input_version#v}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-dev+$(git rev-parse --short=7 HEAD)"
+          fi
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          {
+            echo "version=${version}"
+            echo "short_sha=${short_sha}"
+            echo "build_date=$(date -u +%Y%m%d-%H%M%S)"
+          } >> "$GITHUB_OUTPUT"
+          echo "VERSION_NAME=${version}" >> "$GITHUB_ENV"
+
+      - name: Prepare signing material
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          RELEASE_ALIAS: ${{ secrets.SIGNING_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64}" ] && [ -n "${RELEASE_ALIAS}" ] \
+            && [ -n "${RELEASE_KEY_PASSWORD}" ] && [ -n "${RELEASE_STORE_PASSWORD}" ]; then
+            keystore="$RUNNER_TEMP/simplehook-release.jks"
+            printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore}"
+            echo "使用仓库 secrets 中的正式签名密钥"
+            mode="repo-secret"
+            alias_name="${RELEASE_ALIAS}"
+            key_password="${RELEASE_KEY_PASSWORD}"
+            store_password="${RELEASE_STORE_PASSWORD}"
+          else
+            keystore="$RUNNER_TEMP/simplehook-ci-keystore.jks"
+            alias_name="simplehook-ci"
+            store_password="$(openssl rand -hex 16)"
+            key_password="${store_password}"
+            keytool -genkeypair \
+              -keystore "${keystore}" \
+              -storetype PKCS12 \
+              -alias "${alias_name}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10950 \
+              -storepass "${store_password}" \
+              -keypass "${key_password}" \
+              -dname "CN=SimpleHook CI, O=SimpleHook, C=CN"
+            echo "未配置签名 secrets，已生成临时 keystore（产物可安装，但签名与正式版本不同）"
+            mode="ephemeral"
+          fi
+          test -f "${keystore}"
+          {
+            echo "SIGNING_ALIAS=${alias_name}"
+            echo "SIGNING_KEY_PASSWORD=${key_password}"
+            echo "SIGNING_STORE_PASSWORD=${store_password}"
+            echo "SIGNING_STORE_FILE=${keystore}"
+            echo "KEYSTORE_PATH=${keystore}"
+          } >> "$GITHUB_ENV"
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        if: inputs.run_tests
+        run: bash ./gradlew :app:testRootDebugUnitTest --stacktrace
+
+      - name: Assemble release APK
+        run: bash ./gradlew :app:assembleRootRelease --stacktrace
+
+      - name: Verify and collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/root/release/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "未找到 release APK 产物" >&2
+            ls -R app/build/outputs/apk || true
+            exit 1
+          fi
+          mkdir -p dist
+          for apk in "${apks[@]}"; do
+            if [[ "${apk}" == *unsigned* ]]; then
+              echo "跳过未签名产物: ${apk}" >&2
+              continue
+            fi
+            "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "${apk}"
+            target="dist/SimpleHookR-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short_sha }}.apk"
+            cp -f "${apk}" "${target}"
+            echo "已收集: ${target}"
+          done
+          test -n "$(ls -A dist)"
+          ls -l dist
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SimpleHookR-release-${{ steps.meta.outputs.version }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: inputs.publish_release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: ${{ steps.meta.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*.apk
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Release APK"
+            echo
+            echo "- version: \`${{ steps.meta.outputs.version }}\`"
+            echo "- commit: \`${{ steps.meta.outputs.short_sha }}\`"
+            echo "- 签名方式: \`${{ steps.signing.outputs.mode }}\`"
+            echo "- publish_release: \`${{ inputs.publish_release }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "${KEYSTORE_PATH:-$RUNNER_TEMP/missing.jks}"
