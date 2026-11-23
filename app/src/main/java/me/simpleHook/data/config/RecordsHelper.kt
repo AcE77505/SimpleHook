@@ -13,6 +13,7 @@ import me.simpleHook.core.App
 import me.simpleHook.core.GlobalValue
 import me.simpleHook.core.compat.DocumentCompat
 import me.simpleHook.core.constant.ConfigConstant
+import me.simpleHook.core.constant.RecordPath
 import me.simpleHook.core.constant.Constant
 import me.simpleHook.core.utils.GuiseBase64
 import me.simpleHook.core.utils.OSUtil
@@ -33,6 +34,9 @@ object RecordsHelper {
     private const val EXTENSION_MAX_COMPRESSED_RECORD_BYTES = 16 * 1024 * 1024
     private const val CANCEL_CHECK_INTERVAL_LINES = 64
 
+    @Volatile
+    private var cachedRootUserIds: List<Int>? = null
+
     // Called only while RecordIngestCoordinator owns its coroutine Mutex and IO context.
     internal suspend fun ingestRecordsFromFile(
         context: Context,
@@ -49,7 +53,14 @@ object RecordsHelper {
                 source.dirName
             )
             if (GlobalValue.isRootWork) {
-                rootReadSegments(packageName, source, readyPath, budget, onBatch)
+                // root 下按用户枚举：/data/media/<userId>/Android/media/<pkg>/... ，
+                // 这样分身（user 128，或任何 user）里的记录也能被读到，
+                // 而不是被 /storage/self/primary（在 su 里解析成 user 0）带偏。
+                for (recordRoot in rootRecordRoots(packageName)) {
+                    coroutineContext.ensureActive()
+                    if (shouldStop(budget)) break
+                    rootReadSegments(packageName, source, recordRoot, budget, onBatch)
+                }
             } else if (GlobalValue.isShizukuWork) {
                 shizukuReadSegments(packageName, source, readyPath, budget, onBatch)
             } else {
@@ -105,11 +116,12 @@ object RecordsHelper {
     private suspend fun rootReadSegments(
         packageName: String,
         source: RecordSource,
-        readyPath: String,
+        recordRoot: String,
         budget: ReadBudget,
         onBatch: suspend (List<RecordEntity>) -> Unit
     ) {
-        val names = rootReadManifestNames(packageName, source)
+        val readyPath = RecordPath.readyDir(recordRoot, source.dirName)
+        val names = rootReadManifestNames(recordRoot, source)
         if (names.isEmpty()) return
 
         val coroutineContext = currentCoroutineContext()
@@ -156,13 +168,9 @@ object RecordsHelper {
     }
 
     private fun rootReadManifestNames(
-        packageName: String,
+        recordRoot: String,
         source: RecordSource
-    ): List<String> {
-        val manifestPath = ConfigConstant.RECORD_SOURCE_MANIFEST_PATH.formatPath(
-            packageName,
-            source.dirName
-        )
+    ): List<String> {        val manifestPath = RecordPath.manifestPath(recordRoot, source.dirName)
         val manifestFile = SuFile.open(manifestPath)
         if (!manifestFile.exists() || !manifestFile.isFile) return emptyList()
         return SuFileInputStream.open(manifestFile).bufferedReader(Charsets.UTF_8).useLines { lines ->
@@ -183,6 +191,25 @@ object RecordsHelper {
             name.endsWith(".seg") &&
             !name.contains("/") &&
             !name.contains("\\")
+    }
+
+    /**
+     * root 模式下要读的记录根目录：按 /data/media 下实际存在的用户逐个拼。
+     * 分身（user 128）的记录就落在 /data/media/128/Android/media/<pkg>/SimpleHook/record。
+     */
+    private fun rootRecordRoots(packageName: String): List<String> {
+        return rootUserIds().map { userId -> RecordPath.recordRootForUser(userId, packageName) }
+    }
+
+    private fun rootUserIds(): List<Int> {
+        cachedRootUserIds?.let { return it }
+        val ids = runCatching {
+            SuFile.open("/data/media").listFiles()
+                ?.mapNotNull { it.name.toIntOrNull() }
+                ?: emptyList()
+        }.getOrDefault(emptyList()).toMutableSet()
+        ids += 0
+        return ids.sorted().also { cachedRootUserIds = it }
     }
 
     private suspend fun fileReadSegments(

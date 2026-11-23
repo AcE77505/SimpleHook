@@ -217,27 +217,23 @@ object RecordOutHelper {
         } else {
             null
         }
-        val recordContent = Json.encodeToString(
-            RecordEntity(
-                type = type,
-                subType = finalSubType,
-                record = Json.encodeToString(record),
-                packageName = HookHelper.hostPackageName,
-                processName = HookHelper.hostProcessName,
-                time = TimeUtil.getCurrentTime(pattern = "yy-MM-dd HH:mm:ss"),
-                summaryTitle = summary?.title,
-                summarySubtitle = summary?.subtitle,
-                summaryMeta = summary?.meta
-            )
+        val entity = RecordEntity(
+            type = type,
+            subType = finalSubType,
+            record = Json.encodeToString(record),
+            packageName = HookHelper.hostPackageName,
+            processName = HookHelper.hostProcessName,
+            time = TimeUtil.getCurrentTime(pattern = "yy-MM-dd HH:mm:ss"),
+            summaryTitle = summary?.title,
+            summarySubtitle = summary?.subtitle,
+            summaryMeta = summary?.meta
         )
-//
-
-
-        val compressedRecordContent = compressToBase64(recordContent) ?: return
+        val compressedRecordContent = compressToBase64(Json.encodeToString(entity)) ?: return
         RecordLogger.write(
             packageName = HookHelper.hostPackageName,
             content = compressedRecordContent,
-            source = source
+            source = source,
+            entity = entity
         )
     }
 

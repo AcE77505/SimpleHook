@@ -1,11 +1,15 @@
 package me.simpleHook.core.utils
 
+import android.content.ContentValues
+import androidx.core.net.toUri
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import me.simpleHook.core.constant.ConfigConstant
+import me.simpleHook.core.constant.RecordPath
 import me.simpleHook.data.ExtRecordSettings
+import me.simpleHook.data.local.db.entity.RecordEntity
 import me.simpleHook.data.record.RecordSource
+import me.simpleHook.platform.hook.utils.HookHelper
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.Locale
@@ -45,6 +49,9 @@ object RecordLogger {
     private val extensionMaxCacheMbByPackage = ConcurrentHashMap<String, Int>()
     private val extensionMaxRecordMbByPackage = ConcurrentHashMap<String, Int>()
 
+    @Volatile
+    private var providerUnavailable = false
+
     init {
         executor.execute {
             val buffers = mutableMapOf<BufferKey, PackageBuffer>()
@@ -53,11 +60,15 @@ object RecordLogger {
                 try {
                     val item = logQueue.poll(FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
                     if (item != null) {
-                        val key = BufferKey(item.packageName, item.source)
-                        val buffer = buffers.getOrPut(key) { PackageBuffer() }
-                        buffer.add(item.content)
-                        if (buffer.shouldFlush()) {
-                            flushPackage(key, buffer)
+                        if (item.entity != null && insertViaProvider(item.entity)) {
+                            // provider 已直接入库（同用户实例），不需要落文件
+                        } else {
+                            val key = BufferKey(item.packageName, item.source)
+                            val buffer = buffers.getOrPut(key) { PackageBuffer() }
+                            buffer.add(item.content)
+                            if (buffer.shouldFlush()) {
+                                flushPackage(key, buffer)
+                            }
                         }
                     }
 
@@ -80,10 +91,15 @@ object RecordLogger {
         }
     }
 
-    fun write(packageName: String, content: String, source: RecordSource) {
+    fun write(
+        packageName: String,
+        content: String,
+        source: RecordSource,
+        entity: RecordEntity? = null
+    ) {
         if (shouldDropForRecordSize(packageName, source, content.length)) return
 
-        val item = LogItem(packageName, content, source)
+        val item = LogItem(packageName, content, source, entity)
         if (logQueue.offer(item)) return
 
         val dropped = logQueue.pollFirst()
@@ -98,6 +114,39 @@ object RecordLogger {
                 .computeIfAbsent(BufferKey(packageName, source)) { AtomicLong() }
                 .incrementAndGet()
         }
+    }
+
+    /**
+     * 优先把记录直接写进 SimpleHook 的 RecordProvider（按用户解析，分身里同样可用，
+     * 且不依赖 root / 外部存储路径）。失败再回退到文件队列。
+     */
+    private fun insertViaProvider(entity: RecordEntity): Boolean {
+        if (providerUnavailable) return false
+        if (!HookHelper.isAppContextInitialized) return false
+        val inserted = runCatching {
+            val values = ContentValues().apply {
+                put("type", entity.type.name)
+                put("subType", entity.subType)
+                put("record", entity.record)
+                put("packageName", entity.packageName)
+                put("processName", entity.processName)
+                put("isRead", 0)
+                put("isMark", 0)
+                put("time", entity.time)
+                entity.summaryTitle?.let { put("summaryTitle", it) }
+                entity.summarySubtitle?.let { put("summarySubtitle", it) }
+                entity.summaryMeta?.let { put("summaryMeta", it) }
+            }
+            HookHelper.appContext.contentResolver
+                .insert(FlavorUtil.PROVIDER_RECORD_URI.toUri(), values) != null
+        }.onFailure { error ->
+            // 只有「该用户下没有 SimpleHook / 无权限」这种确定性失败才永久停用，
+            // 其它异常（provider 忙、临时失败）保留重试机会
+            if (error is IllegalArgumentException || error is SecurityException) {
+                providerUnavailable = true
+            }
+        }.getOrDefault(false)
+        return inserted
     }
 
     fun shouldDropForRecordSize(
@@ -121,7 +170,7 @@ object RecordLogger {
     }
 
     fun clear(packageName: String) {
-        File(ConfigConstant.RECORD_DIR.formatPath(packageName)).deleteRecursively()
+        File(RecordPath.recordRootForCurrentUser(packageName)).deleteRecursively()
     }
 
     fun delete(packageName: String) {
@@ -131,9 +180,10 @@ object RecordLogger {
     private fun flushPackage(key: BufferKey, buffer: PackageBuffer) {
         if (buffer.isEmpty()) return
 
-        val sourceDir = File(ConfigConstant.RECORD_SOURCE_DIR.formatPath(key.packageName, key.source.dirName))
-        val tmpDir = File(ConfigConstant.RECORD_SOURCE_TMP_DIR.formatPath(key.packageName, key.source.dirName))
-        val readyDir = File(ConfigConstant.RECORD_SOURCE_READY_DIR.formatPath(key.packageName, key.source.dirName))
+        val recordRoot = RecordPath.recordRootForCurrentUser(key.packageName)
+        val sourceDir = File(RecordPath.sourceDir(recordRoot, key.source.dirName))
+        val tmpDir = File(RecordPath.tmpDir(recordRoot, key.source.dirName))
+        val readyDir = File(RecordPath.readyDir(recordRoot, key.source.dirName))
         if (!sourceDir.exists()) sourceDir.mkdirs()
         if (!tmpDir.exists()) tmpDir.mkdirs()
         if (!readyDir.exists()) readyDir.mkdirs()
@@ -231,7 +281,7 @@ object RecordLogger {
         droppedBytes: Long = 0L
     ) {
         val segments = listSegments(readyDir)
-        val statsFile = File(ConfigConstant.RECORD_SOURCE_STATS_PATH.formatPath(key.packageName, key.source.dirName))
+        val statsFile = File(readyDir.parentFile, "stats.json")
         val oldStats = readStats(statsFile)
         val memoryDropCount = droppedInMemoryBySource[key]?.get() ?: 0L
         val oversizedDropCount = droppedOversizedBySource[key]?.get() ?: 0L
@@ -337,7 +387,8 @@ object RecordLogger {
     private data class LogItem(
         val packageName: String,
         val content: String,
-        val source: RecordSource
+        val source: RecordSource,
+        val entity: RecordEntity? = null
     )
 
     private data class BufferKey(
